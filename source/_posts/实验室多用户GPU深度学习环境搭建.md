@@ -1,0 +1,471 @@
+---
+title: 实验室多用户GPU深度学习环境搭建
+date: 2021-04-30 10:21:23
+tags:
+---
+
+实验室的.187服务器带了9张 GeForce RTX 2080 Ti 显卡用于深度学习训练模型。由于每个人的环境不同，使用Anaconda创建虚拟环境能够解决部分问题，但是还是难免会遇到用户需要的软件版本冲突。对比了网上的很多方法（Linux多用户管理，Docker， LXD），我们选择了基于LXD容器的方法进行深度学习环境搭建。
+
+该环境相对于之前，主要的优势：
+
+1. 用户相互隔离，各种环境直接不会相互冲突。
+2. 用户在自己的虚拟环境下，拥有root权限。能够自行安装需要的软件，并且不会影响到其他用户。
+3. 用户的虚拟环境无法访问宿主机。用户可以随意安装软件、开放端口，服务器只开放22端口，让服务器更加安全。
+
+接下来是环境搭建的记录：
+
+## 1. lxd的安装与初始化
+
+### 1.1 安装lxd
+
+- LXD 实现虚拟容器
+- ZFS 用于管理物理磁盘，支持LXD高级功能
+- bridge-utils 用于搭建网桥
+
+#### 安装LXD、ZFS和bridge-utils
+
+```shell
+sudo apt install lxd zfsutils-linux bridge-utils
+```
+
+### 1.2 配置网桥
+
+配置宿主机的网桥：
+
+```shell
+# ubuntu 16.04 使用interfaces配置网络
+sudo vim /etc/network/interfaces
+```
+
+```yaml
+# interfaces(5) file used by ifup(8) and ifdown(8)
+auto lo
+iface lo inet loopback
+
+auto br0
+iface br0 inet static
+    address 172.16.59.187/24 # ip
+    gateway 172.16.59.254  # 网关
+    dns-nameservers 223.5.5.5 114.114.114.114 # dns
+# bridge options
+bridge_ports eno2
+iface eno2 inet manual
+```
+
+eno2是ubuntu中的网卡，可以通过ifconfig查看。
+![](https://cdn.jsdelivr.net/gh/Renl1001/ImgHosting/My-Pic/20210429193712.png)
+
+```shell
+# ubuntu 18以后使用 netplan 配置
+sudo vim /etc/netplan/01-netcfg.yaml
+# netplan 会读取/etc/netplan/目录下的yaml文件并配置网络。
+```
+
+```yaml
+# This file describes the network interfaces available on your system
+# For more information, see netplan(5).
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eno2:
+      dhcp4: no
+      dhcp6: no
+  bridges:
+    br0:
+      dhcp4: no
+      dhcp6: no
+      interfaces:
+        - eno2
+      addresses: [ 172.16.59.187/24 ]
+      gateway4: 172.16.59.254
+      nameservers:
+          addresses:
+              - 223.5.5.5
+              - 114.114.114.114
+      parameters:
+          stp: false
+          forward-delay: 0
+```
+
+```shell
+# 应用更新
+sudo netplan apply
+```
+
+### 1.3 配置ZFS
+
+#### 使用GParted创建一个适量大小的分区
+
+![](https://cdn.jsdelivr.net/gh/Renl1001/ImgHosting/My-Pic/image-20210421091010065.png)
+
+#### 使用fdisk进行分区
+
+```shell
+sudo fdisk /dev/sdb
+```
+
+![](https://cdn.jsdelivr.net/gh/Renl1001/ImgHosting/My-Pic/image-20210421091152124.png)
+
+#### 创建ZFS块
+
+在刚刚创建的块设备 /dev/sdb2 上创建一个ZFS存储池
+
+```shell
+sudo lxc storage create zfs-pool zfs source=/dev/sdb2
+```
+
+### 3.2 初始化LXD
+
+将管理员账号加入lxd用户组，后续lxd操作就不用写sudo了（新增）
+
+```shell
+sudo gpasswd -a $(whoami) lxd
+```
+
+初始化lxd
+
+```shell
+lxd init
+```
+
+![](https://cdn.jsdelivr.net/gh/Renl1001/ImgHosting/My-Pic/image-20210421091421557.png)
+
+- LXD clustering？ 不需要 no
+- 是否创建存储池？刚刚创建过了，所以不需要 no
+- MASS？ 不需要 no
+- 是否创建网桥？前面创建过了，不需要 no （图中创建的网桥后面没用上）
+- IPv4？ auto
+- IPv6？ auto
+- 最后三个默认就好
+
+
+#### 修改容器默认配置
+
+```shell
+lxc profile edit default	
+```
+
+设置默认磁盘大小
+
+![20210429200209](https://cdn.jsdelivr.net/gh/Renl1001/ImgHosting/My-Pic/20210429200209.png)
+
+## 2. 容器的创建
+
+### 2.1 国内源
+
+#### 使用清华的镜像源（加速创建）
+
+```shell
+lxc remote add tuna-images https://mirrors.tuna.tsinghua.edu.cn/lxc-images/ --protocol=simplestreams --public
+```
+
+#### 列出可用的镜像
+
+```shell
+lxc image list tuna-images:
+```
+
+![](https://cdn.jsdelivr.net/gh/Renl1001/ImgHosting/My-Pic/image-20210421091806361.png)
+
+### 2.2 创建 Ubuntu18.04 容器
+
+#### 使用清华源中的ubuntu镜像创建一个容器
+
+```shell
+# 创建容器：{name} 
+lxc launch tuna-images:ubuntu/18.04 {name}
+```
+
+#### 进入容器
+
+```shell
+lxc exec {name} bash
+```
+
+#### 修改密码
+
+默认会有root和ubuntu两个账号
+
+```shell
+passwd root
+passwd ubuntu
+```
+
+#### 安装ssh
+
+```shell
+# 装OpenSSH服务
+sudo apt install openssh-server
+
+# 启动SSH服务
+sudo service ssh start
+
+# 查看SSH服务状态
+sudo service ssh status
+```
+
+#### ssh连接容器
+
+##### 1. 桥接 （桥接的方式能够让容器拥有独立的ip，本文采用的此方法）
+
+为容器添加网络设备eth0，桥接到host本地网络
+
+```shell
+# 宿主机执行
+lxc config device add {name} eth0 nic nictype=bridged parent=br0 name=eth0
+```
+
+编辑interfaces文件指定静态id
+
+```shell
+lxc exec {name} -- vim /etc/netplan/10-lxc.yaml
+```
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: no
+      addresses: [172.16.59.121/24]
+      gateway4: 172.16.59.254
+      nameservers:
+        addresses: [223.5.5.5, 114.114.114.114]
+```
+
+```shell
+lxc exec {name} -- netplan apply
+```
+
+##### 2. 端口转发 
+
+```shell
+lxc config device add {name} proxy0 proxy listen=tcp:172.16.59.187:23301 connect=tcp:10.136.53.74:22 bind=host
+```
+
+为虚拟机`test`添加代理设备 `proxy0`
+
+验证：
+
+```shell
+sudo lsof -i -n | grep http
+```
+
+移除代理：
+
+```shell
+lxc config device remove {name} proxy0
+```
+
+## 3. 初始容器配置
+
+### 3.1 换源
+
+#### 备份
+
+```shell
+sudo mv /etc/apt/sources.list /etc/apt/sources.list.bak
+```
+
+#### 添加清华源
+
+```shell
+sudo vim /etc/apt/sources.list
+
+# https://mirrors.tuna.tsinghua.edu.cn/help/ubuntu/
+```
+
+### 3.2 为容器添加显卡
+
+#### 添加所有gpu
+
+```shell
+lxc config device add {name} gpu gpu
+```
+
+#### 添加指定gpu
+
+```shell
+lxc config device add {name} gpu0 gpu id=0
+```
+
+### 3.3 设置共享目录
+
+```shell
+# 设置键值
+lxc config set {name} security.privileged true
+# 设置共享目录，其中{name}为虚拟的设备名称，lxd会虚拟出该设备并导通接通两者共享目录。
+# path1为宿主机下共享目录路径，path2为容器下共享目录路径
+lxc config device add {name} {shareName} disk source={path1} path={path2}
+# 
+lxc config device add test shareDir disk source=/UbuntuData path=/UbuntuData
+```
+
+### 3.4 设置容器使用docker （如果要在容器中使用docker，需要设置）
+
+```shell
+lxc config set {name} security.nesting true
+lxc config set {name} security.privileged true
+```
+
+### 3.5 安装显卡驱动
+
+```shell
+# 在容器中使用--no-kernel-module安装。注意，容器中的nvidia版本和宿主机必须要一样
+sudo sh ./NVIDIA-Linux-X86_64-[YOURVERSION].run --no-kernel-module
+```
+
+## 4. 制作容器模板
+
+配置好一个容器后，可以将该容器作为模板，生成镜像。后面为每个用户创建容器时可以直接用已有的镜像创建。
+
+#### 停止容器
+
+```shell
+lxc stop {name}
+```
+
+#### 将test容器保存为ubuntu-18.04-server镜像
+
+```shell
+lxc publish {name} --alias ubuntu-18.04-server --public
+```
+
+#### 查看镜像
+
+```shell
+lxc image list
+```
+
+![20210430093433](https://cdn.jsdelivr.net/gh/Renl1001/ImgHosting/My-Pic/20210430093433.png)
+
+#### 使用镜像新建容器
+
+```shell
+lxc launch 76376ea7db72 test2
+```
+
+## 5. 制作图形化界面（这里没成功，连不上远程桌面，只做记录）
+
+### 5.1 安装无推荐软件的ubuntu桌面(默认安装gnome，完整安装会有很多无关的软件)
+
+```shell
+sudo apt install --no-install-recommends ubuntu-desktop
+```
+
+### 5.2 安装远程连接 XRDP
+
+```shell
+wget https://www.c-nergy.be/downloads/xrdp-installer-1.2.2.zip
+unzip xrdp-installer-1.2.2.zip 
+mkdir Downloads
+mv xrdp-installer-1.2.2.sh Downloads/
+chmod +x  ~/Downloads/xrdp-installer-1.2.2.sh
+
+./xrdp-installer-1.2.2.sh -c -l -s
+
+# 1. 可能会报错，需要check包   sudo apt install check
+# 2. 使用github的镜像网站加速github访问，github.com.cnpmjs.org。
+# 更新 .gitsubmodule中对应submodule的条目URL
+# 更新 .git/config 中对应submodule的条目的URL # https://www.jianshu.com/p/ca2862e449fa
+# 3. 安装后连接失败可能是显卡驱动的原因
+```
+
+### 5.3 远程连接
+
+windows运行mstsc，输入ip连接。
+
+## 6. 容器管理
+
+### 6.1 查看zfs储存卷的占用情况
+
+```shell
+zpool list
+```
+
+### 6.2 为容器修改参数配置
+
+- 修改容器参数
+
+```shell
+lxc config edit {name}
+```
+
+![20210430094722](https://cdn.jsdelivr.net/gh/Renl1001/ImgHosting/My-Pic/20210430094722.png)
+
+- 配置默认容器参数（新容器的参数会继承default配置的参数，容器会优先使用自己的参数）
+
+```shell
+lxc profile edit default
+```
+
+### 6.3 创建新容器
+
+给一个新用户创建容器的步骤。目前只能管理员手动执行命令，后续考虑编写自动化脚本，或者做个web页面进行管理。
+
+#### （1）查看镜像
+
+```shell
+lxc image list
+```
+
+![20210430093433](https://cdn.jsdelivr.net/gh/Renl1001/ImgHosting/My-Pic/20210430093433.png)
+
+#### （2）使用镜像新建容器
+
+```shell
+lxc launch 76376ea7db72 {name}
+```
+
+#### （3）编辑interfaces文件指定静态id
+
+```shell
+lxc exec {name} -- vim /etc/netplan/10-lxc.yaml
+```
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: no
+      addresses: [172.16.59.12x/24] # 自己设置
+      gateway4: 172.16.59.254
+      nameservers:
+        addresses: [223.5.5.5, 114.114.114.114]
+```
+
+```shell
+# 刷新网络设置
+lxc exec {name} -- netplan apply
+```
+
+#### (4) 为容器添加显卡
+
+```shell
+lxc config device add {name} gpu gpu # 添加全部显卡 *默认已添加
+lxc config device add {name} gpu0 gpu id=0 # 添加指定gpu
+```
+
+#### (5) 安装显卡驱动 *(默认已安装)
+
+```shell
+sudo sh ./NVIDIA-Linux-X86_64-[YOURVERSION].run --no-kernel-module
+```
+
+#### (6) 修改密码（用户自己修改）
+
+```shell
+passwd ubuntu
+```
+
+## 参考链接
+
+- https://shenxiaohai.me/2018/12/03/gpu-server-lab/  
+- https://butui.me/post/lxd-gpu-server/  
+- https://deserts.io/lxd-gpu-server/  
+- https://github.com/shenuiuin/LXD_GPU_SERVER  
+- https://zhuanlan.zhihu.com/p/25710517  
+- https://xungejiang.com/2019/05/20/lxd-subset-ip/  
+- https://openwares.net/2019/06/03/lxd-containers-bridged-host-network/  
